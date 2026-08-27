@@ -1,13 +1,9 @@
 # Rust
 /target/
-Cargo.lock
 
-# Runtime data
-data/app.db
-data/app.db-shm
-data/app.db-wal
-config/config.toml
-config/keymaps.toml
+# Runtime data (app recreates these dirs on start)
+/data/
+/config/
 
 # OS
 .DS_Store
@@ -22,3 +18,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Claude Code local
+.claude/settings.local.json
