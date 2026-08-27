@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Runtime data
+data/app.db
+data/app.db-shm
+data/app.db-wal
+config/config.toml
+config/keymaps.toml
+
+# OS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
