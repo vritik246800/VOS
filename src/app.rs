@@ -10,6 +10,14 @@ pub struct AppAreas {
     pub process_list: Rect,
     pub menu_list: Rect,
     pub side_panel: Rect,
+    pub image_body: Rect,
+    pub video_frame: Rect,
+    pub video_progress: Rect,
+    pub video_controls: Rect,
+    pub pdf_body: Rect,
+    pub pdf_previous: Rect,
+    pub pdf_next: Rect,
+    pub pdf_mode: Rect,
 }
 
 use crate::audio::player::AudioPlayer;
@@ -203,15 +211,14 @@ pub struct App {
     // Media
     pub audio_player: Option<AudioPlayer>,
     pub video_player: Option<VideoPlayer>,
-    /// Pre-decoded RGB24 pixels (avoids re-decoding every frame)
-    pub image_rgb: Option<Vec<u8>>,
-    /// Original image dimensions (width, height) after resize cap
-    pub image_dims: (u32, u32),
-    pub image_title: String,
+    pub image_viewer: Option<crate::modules::image_viewer::ImageViewer>,
+    pub pdf: Option<crate::modules::pdf::PdfDocument>,
+    pub media_fullscreen: bool,
     /// Set during draw(), consumed after draw() for Kitty injection
     pub pending_kitty: Option<KittyFrame>,
-    /// Last area used for Kitty image render — skip retransmit when unchanged
+    /// Last area and content revision sent to Kitty — static media is not retransmitted.
     pub kitty_last_area: Option<ratatui::layout::Rect>,
+    pub kitty_last_version: Option<u64>,
 
     // UI state
     pub command_palette: CommandPalette,
@@ -236,11 +243,6 @@ pub struct App {
     // Config panel navigation
     pub config_selected: usize,
 
-    // PDF viewer
-    pub pdf_pages: Vec<String>,
-    pub pdf_scroll: usize,
-    pub pdf_title: String,
-
     // Help panel
     pub help_topic: usize,
     pub help_tab: usize,
@@ -249,9 +251,11 @@ pub struct App {
     // Splash
     pub splash_tick: u16,
 
-    // Mouse support (3.4): cached panel geometry + double-click detection.
+    // Mouse support: cached panel geometry, double-click and media dragging.
     pub last_areas: AppAreas,
     pub last_click: Option<std::time::Instant>,
+    pub media_drag: Option<(u16, u16)>,
+    pub video_scrubbing: bool,
 
     // Favorites popup (3.6)
     pub favorites_list: Vec<PathBuf>,
@@ -372,11 +376,12 @@ impl App {
             music_library: MusicLibrary::new(),
             audio_player: None,
             video_player: None,
-            image_rgb: None,
-            image_dims: (0, 0),
-            image_title: String::new(),
+            image_viewer: None,
+            pdf: None,
+            media_fullscreen: false,
             pending_kitty: None,
             kitty_last_area: None,
+            kitty_last_version: None,
             command_palette: CommandPalette::new(),
             menu_state,
             clipboard: None,
@@ -385,15 +390,14 @@ impl App {
             use_kitty,
             kitty_cell_px,
             config_selected: 0,
-            pdf_pages: Vec::new(),
-            pdf_scroll: 0,
-            pdf_title: String::new(),
             help_topic: 0,
             help_tab: 0,
             help_scroll: 0,
             splash_tick: 0,
             last_areas: AppAreas::default(),
             last_click: None,
+            media_drag: None,
+            video_scrubbing: false,
             favorites_list: Vec::new(),
             favorites_state: ratatui::widgets::ListState::default(),
             theme_switcher_idx: 0,
@@ -525,10 +529,9 @@ impl App {
 
     pub fn needs_tick(&self) -> bool {
         self.audio_player.as_ref().map_or(false, |_| true)
-            || self
-                .video_player
-                .as_ref()
-                .map_or(false, |v| v.is_playing || v.is_loading)
+            || self.video_player.as_ref().is_some_and(|v| v.needs_tick())
+            || (matches!(self.state.mode, AppMode::ImageViewer)
+                && self.image_viewer.as_ref().is_some_and(|v| v.needs_tick()))
             || self.state.side_pct != self.state.side_pct_target
             || self.state.git_pct != self.state.git_pct_target
             || self.state.music_pct != self.state.music_pct_target
@@ -584,6 +587,12 @@ impl App {
         }
         if let Some(vp) = &mut self.video_player {
             let _ = vp.tick();
+        }
+        if matches!(self.state.mode, AppMode::ImageViewer)
+            && let Some(viewer) = &mut self.image_viewer
+            && viewer.tick(std::time::Instant::now())
+        {
+            self.reset_kitty_cache();
         }
         if matches!(self.state.mode, AppMode::ProcessViewer) {
             self.system_monitor.tick();
@@ -863,31 +872,66 @@ impl App {
         }
     }
 
+    pub fn open_image(&mut self, path: std::path::PathBuf) {
+        match crate::modules::image_viewer::ImageViewer::open(&path) {
+            Ok(viewer) => {
+                self.image_viewer = Some(viewer);
+                self.media_fullscreen = false;
+                self.media_drag = None;
+                self.reset_kitty_cache();
+                self.state.set_mode(AppMode::ImageViewer);
+            }
+            Err(error) => self
+                .state
+                .push_notification(Notification::error(format!("Cannot open image: {error}"))),
+        }
+    }
+
     pub fn open_pdf(&mut self, path: std::path::PathBuf) {
-        let title = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("PDF")
-            .to_string();
+        match crate::modules::pdf::PdfDocument::open(&path) {
+            Ok(document) => {
+                self.pdf = Some(document);
+                self.media_fullscreen = false;
+                self.media_drag = None;
+                self.reset_kitty_cache();
+                self.state.set_mode(AppMode::PdfViewer);
+            }
+            Err(error) => self
+                .state
+                .push_notification(Notification::error(format!("Cannot open PDF: {error}"))),
+        }
+    }
 
-        let text = std::process::Command::new("pdftotext")
-            .arg(&path)
-            .arg("-")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or_else(|| {
-                format!(
-                    "Error: pdftotext not found.\nInstall: brew install poppler\n\nFile: {}",
-                    path.display()
-                )
-            });
+    pub fn open_video(&mut self, path: std::path::PathBuf) {
+        let cell_px = if self.use_kitty {
+            self.kitty_cell_px
+        } else {
+            (1, 2)
+        };
+        match crate::video::player::VideoPlayer::new(path, 80, 40, cell_px) {
+            Ok(player) => {
+                self.video_player = Some(player);
+                self.media_fullscreen = false;
+                self.media_drag = None;
+                self.video_scrubbing = false;
+                self.reset_kitty_cache();
+                self.state.set_mode(AppMode::VideoPlayer);
+            }
+            Err(error) => self
+                .state
+                .push_notification(Notification::error(format!("Cannot open video: {error}"))),
+        }
+    }
 
-        self.pdf_pages = text.lines().map(|l| l.to_string()).collect();
-        self.pdf_scroll = 0;
-        self.pdf_title = title;
-        self.state.set_mode(AppMode::PdfViewer);
+    pub fn toggle_media_fullscreen(&mut self) {
+        self.media_fullscreen = !self.media_fullscreen;
+        self.media_drag = None;
+    }
+
+    pub fn reset_kitty_cache(&mut self) {
+        self.pending_kitty = None;
+        self.kitty_last_area = None;
+        self.kitty_last_version = None;
     }
 
     pub fn toggle_side_terminal(&mut self) {
