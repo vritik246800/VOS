@@ -1,34 +1,37 @@
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 
-/// Render the image panel border and reserve the inner area for Kitty rendering.
-///
-/// Returns the inner [`Rect`] so the caller can set `app.pending_kitty`.
-/// The inner area is filled with black spaces so ratatui does not paint over
-/// the Kitty image that will be injected after `terminal.draw()`.
-pub fn render_image_panel(f: &mut Frame, area: Rect, title: &str) -> Rect {
+pub fn render_image_panel(f: &mut Frame, area: Rect, title: &str, status: &str) -> Rect {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", title))
+        .title(format!(" {title} — {status} "))
         .border_style(Style::default().fg(Color::Magenta));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(chunks[0]);
+    f.render_widget(block, chunks[0]);
 
-    // Fill inner area with black spaces to reserve it for Kitty.
-    let blank_lines: Vec<Line> = (0..inner.height)
-        .map(|_| {
-            Line::from(vec![Span::styled(
-                " ".repeat(inner.width as usize),
-                Style::default().bg(Color::Black),
-            )])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(blank_lines), inner);
-
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" Wheel ", Style::default().fg(Color::Yellow)),
+        Span::raw("zoom  "),
+        Span::styled(" Drag ", Style::default().fg(Color::Yellow)),
+        Span::raw("pan  "),
+        Span::styled(" Space ", Style::default().fg(Color::Yellow)),
+        Span::raw("GIF  "),
+        Span::styled(" 0 ", Style::default().fg(Color::Yellow)),
+        Span::raw("fit  "),
+        Span::styled(" F ", Style::default().fg(Color::Yellow)),
+        Span::raw("full  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Yellow)),
+        Span::raw("close"),
+    ]));
+    f.render_widget(hints, chunks[1]);
     inner
 }
