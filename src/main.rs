@@ -228,8 +228,11 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
     ui::notifications::render_notifications(f, f.area(), &app.state.notifications);
 }
 
-fn popup_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+fn popup_rect(area: ratatui::layout::Rect, fullscreen: bool) -> ratatui::layout::Rect {
     use ratatui::layout::Rect;
+    if fullscreen {
+        return area;
+    }
     let w = (area.width * 88 / 100).max(20).min(area.width);
     let h = (area.height * 88 / 100).max(8).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -436,84 +439,156 @@ fn render_main(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
 
     // ── Popup overlays ──────────────────────────────────────────────────────────
     if is_popup {
-        let popup = popup_rect(area);
-        // Skip Clear in Kitty+video mode: writing to cells erases the Kitty
-        // image layer, causing flicker. The image covers the inner area anyway.
-        let skip_clear = app.use_kitty && matches!(app.state.mode, AppMode::VideoPlayer);
+        let popup = popup_rect(area, app.media_fullscreen);
+        // Visual Kitty frames cover the whole inner area; clearing cells would erase them.
+        let skip_clear = app.use_kitty
+            && (matches!(app.state.mode, AppMode::ImageViewer | AppMode::VideoPlayer)
+                || (matches!(app.state.mode, AppMode::PdfViewer)
+                    && app.pdf.as_ref().is_some_and(|pdf| pdf.is_visual())));
         if !skip_clear {
             f.render_widget(Clear, popup);
         }
 
         match app.state.mode.clone() {
             AppMode::ImageViewer => {
-                let title = app.image_title.clone();
-                let inner = ui::image_panel::render_image_panel(f, popup, &title);
-                if app.use_kitty {
-                    // Kitty protocol: only retransmit when area changes (static image)
-                    if app.kitty_last_area != Some(inner) {
-                        app.kitty_last_area = Some(inner);
-                        if let Some(rgb) = app.image_rgb.clone() {
-                            let dims = app.image_dims;
+                if let Some(viewer) = &mut app.image_viewer {
+                    let inner = ui::image_panel::render_image_panel(
+                        f,
+                        popup,
+                        &viewer.title,
+                        &viewer.status(),
+                    );
+                    app.last_areas.image_body = inner;
+                    let (px_w, px_h) = if app.use_kitty {
+                        (
+                            u32::from(inner.width) * u32::from(app.kitty_cell_px.0),
+                            u32::from(inner.height) * u32::from(app.kitty_cell_px.1),
+                        )
+                    } else {
+                        (u32::from(inner.width), u32::from(inner.height) * 2)
+                    };
+                    let version = viewer.version();
+                    let rendered = viewer.render(px_w, px_h).clone();
+                    let dims = rendered.dimensions();
+                    if app.use_kitty {
+                        if app.kitty_last_area != Some(inner)
+                            || app.kitty_last_version != Some(version)
+                        {
                             app.pending_kitty = Some(kitty::KittyFrame {
                                 image_id: 1,
                                 area: inner,
-                                rgb_data: rgb,
+                                rgb_data: rendered.into_rgb(),
                                 px_width: dims.0,
                                 px_height: dims.1,
                             });
+                            app.kitty_last_area = Some(inner);
+                            app.kitty_last_version = Some(version);
                         }
+                    } else {
+                        let lines = kitty::rgb_to_halfblock_lines(
+                            rendered.rgb(),
+                            dims.0,
+                            dims.1,
+                            inner.width,
+                            inner.height,
+                        );
+                        f.render_widget(ratatui::widgets::Paragraph::new(lines), inner);
                     }
-                } else if let Some(rgb) = &app.image_rgb {
-                    // 24-bit half-block fallback
-                    let dims = app.image_dims;
-                    let lines = kitty::rgb_to_halfblock_lines(
-                        rgb,
-                        dims.0,
-                        dims.1,
-                        inner.width,
-                        inner.height,
-                    );
-                    f.render_widget(ratatui::widgets::Paragraph::new(lines), inner);
                 }
             }
             AppMode::VideoPlayer => {
                 if let Some(vp) = &mut app.video_player {
-                    let frame_area = ui::video_panel::render_video_panel(f, popup, vp);
-                    // Keep cell_px in sync (terminal may have been resized).
-                    if app.use_kitty {
-                        vp.cell_px = app.kitty_cell_px;
-                    }
-                    if let Some(ka) = frame_area {
-                        if let Some(rgb) = vp.current_raw_frame.clone() {
-                            if app.use_kitty {
-                                // Pixel dims = char dims × cell pixel size.
-                                let px_w = vp.width as u32 * vp.cell_px.0 as u32;
-                                let px_h = vp.height as u32 * vp.cell_px.1 as u32;
+                    vp.cell_px = if app.use_kitty {
+                        app.kitty_cell_px
+                    } else {
+                        (1, 2)
+                    };
+                    let areas = ui::video_panel::render_video_panel(f, popup, vp);
+                    app.last_areas.video_frame = areas.frame;
+                    app.last_areas.video_progress = areas.progress;
+                    app.last_areas.video_controls = areas.controls;
+                    if let Some(rgb) = vp.current_raw_frame.clone() {
+                        let px_w = vp.width as u32 * vp.cell_px.0 as u32;
+                        let px_h = vp.height as u32 * vp.cell_px.1 as u32;
+                        if app.use_kitty {
+                            if app.kitty_last_area != Some(areas.frame)
+                                || app.kitty_last_version != Some(vp.frame_version)
+                            {
                                 app.pending_kitty = Some(kitty::KittyFrame {
                                     image_id: 2,
-                                    area: ka,
+                                    area: areas.frame,
                                     rgb_data: rgb,
                                     px_width: px_w,
                                     px_height: px_h,
                                 });
-                            } else {
-                                // 24-bit half-block fallback
-                                let px_w = vp.width as u32;
-                                let px_h = vp.height as u32 * 2;
-                                let lines = kitty::rgb_to_halfblock_lines(
-                                    &rgb, px_w, px_h, ka.width, ka.height,
-                                );
-                                f.render_widget(ratatui::widgets::Paragraph::new(lines), ka);
+                                app.kitty_last_area = Some(areas.frame);
+                                app.kitty_last_version = Some(vp.frame_version);
                             }
+                        } else {
+                            let lines = kitty::rgb_to_halfblock_lines(
+                                &rgb,
+                                px_w,
+                                px_h,
+                                areas.frame.width,
+                                areas.frame.height,
+                            );
+                            f.render_widget(ratatui::widgets::Paragraph::new(lines), areas.frame);
                         }
                     }
                 }
             }
             AppMode::PdfViewer => {
-                let lines = app.pdf_pages.clone();
-                let scroll = app.pdf_scroll;
-                let title = app.pdf_title.clone();
-                ui::pdf_panel::render_pdf_panel(f, popup, &lines, scroll, &title);
+                if let Some(document) = &mut app.pdf {
+                    let areas = ui::pdf_panel::render_pdf_panel(f, popup, document);
+                    app.last_areas.pdf_body = areas.body;
+                    app.last_areas.pdf_previous = areas.previous;
+                    app.last_areas.pdf_next = areas.next;
+                    app.last_areas.pdf_mode = areas.mode;
+                    if document.is_visual() {
+                        let (px_w, px_h) = if app.use_kitty {
+                            (
+                                u32::from(areas.body.width) * u32::from(app.kitty_cell_px.0),
+                                u32::from(areas.body.height) * u32::from(app.kitty_cell_px.1),
+                            )
+                        } else {
+                            (
+                                u32::from(areas.body.width),
+                                u32::from(areas.body.height) * 2,
+                            )
+                        };
+                        let version = document.version();
+                        if let Some(rendered) = document.render(px_w, px_h).cloned() {
+                            let dims = rendered.dimensions();
+                            if app.use_kitty {
+                                if app.kitty_last_area != Some(areas.body)
+                                    || app.kitty_last_version != Some(version)
+                                {
+                                    app.pending_kitty = Some(kitty::KittyFrame {
+                                        image_id: 3,
+                                        area: areas.body,
+                                        rgb_data: rendered.into_rgb(),
+                                        px_width: dims.0,
+                                        px_height: dims.1,
+                                    });
+                                    app.kitty_last_area = Some(areas.body);
+                                    app.kitty_last_version = Some(version);
+                                }
+                            } else {
+                                let lines = kitty::rgb_to_halfblock_lines(
+                                    rendered.rgb(),
+                                    dims.0,
+                                    dims.1,
+                                    areas.body.width,
+                                    areas.body.height,
+                                );
+                                f.render_widget(
+                                    ratatui::widgets::Paragraph::new(lines),
+                                    areas.body,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
