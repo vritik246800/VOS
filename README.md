@@ -15,9 +15,10 @@ Inspired by Midnight Commander, Vim, tmux and Hyprland.
 | Rust (edition 2024) | building |
 | A Nerd Font in the terminal | all icons (JetBrains Mono Nerd Font, Hack Nerd Font, …) |
 | `ffmpeg` + `ffprobe` in `$PATH` | video player (frame extraction + probing) |
-| An audio output device | audio player (rodio) |
-| `pdftotext` (poppler) | PDF viewer |
-| Kitty-compatible terminal | *optional* — native-resolution image/video rendering |
+| `ffplay` in `$PATH` | *optional* — video sound, volume and mute (bundled with ffmpeg) |
+| An audio output device | audio player (rodio) and video sound |
+| `pdfinfo` + `pdftotext` + `pdftoppm` (poppler) | PDF page rendering and text mode |
+| Kitty-compatible terminal | *optional* — native-resolution image/PDF/video rendering |
 | `docker`, `systemctl`, `crontab`, `ssh`/`sftp`, `brew`/`apt`/`dnf`/`pacman`, `man` | the matching module (each degrades gracefully when absent) |
 
 ## Build & run
@@ -105,9 +106,9 @@ also be opened from command mode.
 | Module | What it does |
 |---|---|
 | **Audio Player** | Music library scanned from `music_dir` and indexed in the DB (lofty tags): Artists → Albums → Tracks drill-down, queue management, seek, volume, and a mini side panel that keeps playing while you work elsewhere |
-| **Video Player** | Terminal video playback via `ffmpeg` with a background prefetch thread (8 frames ahead); Kitty native-resolution or ANSI half-block rendering |
-| **Image Viewer** | PNG/JPEG/GIF/BMP/WebP/TIFF, Kitty or half-block |
-| **PDF Viewer** | Scrollable text extraction via `pdftotext` |
+| **Video Player** | Autoplay via `ffmpeg` with a bounded background buffer, synchronized `ffplay` sound, seek/scrub, volume, mute, speed, fullscreen and mouse controls; aspect-correct Kitty or ANSI half-block rendering |
+| **Image Viewer** | PNG/JPEG/GIF/BMP/WebP/TIFF with animated GIF playback, aspect-correct fit, zoom, pan, fullscreen and mouse controls; Kitty or half-block |
+| **PDF Viewer** | Page-by-page visual rendering via Poppler plus an extracted-text mode, page navigation, zoom, pan, fullscreen and mouse controls |
 
 ### System
 
@@ -177,7 +178,20 @@ No Vim modes — shortcuts are always active.
 
 ### Video player
 
-`Space` play/pause · `←/→` seek 5s · `Esc`/`q` close
+`Space` play/pause/replay · `S` stop at start · `←/→` seek 5s · `Shift+←/→` seek 30s ·
+`+`/`-` volume · `m` mute · `[`/`]` speed · `f` fullscreen · `Esc`/`q` close.
+Mouse: click the video or buttons, click/drag the progress bar, wheel changes volume.
+
+### Image viewer
+
+`+`/`-` or wheel zoom · arrows/drag pan · `0`/double-click fit · `Space` pause GIF ·
+`[`/`]` previous/next GIF frame · `f` fullscreen · `Esc`/`q` close.
+
+### PDF viewer
+
+`PgUp/PgDn` or `←/→` previous/next page · `Home`/`End` first/last page · `t` visual/text mode ·
+`+`/`-` zoom · drag to pan · `0` fit · `f` fullscreen · `Esc`/`q` close.
+Mouse: buttons change page/mode, wheel turns visual pages and scrolls text (turning at its edges).
 
 ### Git
 
@@ -219,9 +233,9 @@ Per-mode key hints are always shown in the hint bar, and `F1` opens the full ref
 ## Graphics
 
 `kitty.rs` implements the Kitty graphics protocol. Detection happens once at startup; when the
-terminal supports it, images and video are drawn at real pixel resolution (the frame is injected
-right after ratatui paints, so the reserved area exists first). Everywhere else VOS falls back to
-ANSI half-block rendering, so nothing is ever unavailable — only lower resolution.
+terminal supports it, images, visual PDF pages and video are drawn at real pixel resolution (frames
+are injected after ratatui paints). Content keeps its aspect ratio and is cached by area and revision.
+Everywhere else VOS falls back to ANSI half-block rendering, so only the resolution changes.
 
 ## Plugins
 
