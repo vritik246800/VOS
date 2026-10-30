@@ -43,8 +43,10 @@ Always run from the repository root — the app resolves `config/config.toml` an
 ## Runtime dependencies
 
 - `ffmpeg` + `ffprobe` in `$PATH` — video player (frame extraction + probing)
-- Audio device — audio player (rodio)
-- Kitty terminal — optional; enables native-resolution image/video rendering
+- `ffplay` in `$PATH` — optional video sound (volume, mute and playback speed)
+- `pdfinfo` + `pdftotext` + `pdftoppm` in `$PATH` (poppler) — PDF pages and text mode
+- Audio device — audio player (rodio) and video sound
+- Kitty terminal — optional; enables native-resolution image/PDF/video rendering
 
 ## Architecture
 
@@ -64,15 +66,15 @@ The Kitty frame is injected **after** `terminal.draw()` completes — ratatui mu
 
 ### Central state (`App` in `app.rs`)
 
-`App` owns all state. `render_*()` functions take `&App` (or `&mut App` for widgets needing `ListState`) — they never mutate application state. All state mutations go through `handle_input()` → `app.execute_command()` or direct field writes in `handle_input`.
+`App` owns all state. `render_*()` functions take `&App` (or `&mut App` for widgets and media caches). Rendering only updates cached geometry/frames; behavior changes go through `handle_input()` → `app.execute_command()`, direct field writes in `handle_input`, or `app.tick()`.
 
 ### Mode system (`core/state.rs`)
 
 `AppState::set_mode()` saves `prev_mode` before switching. Three modes are **popup overlays** — they render over `prev_mode`'s content:
 
-- `AppMode::ImageViewer` — static image via Kitty or half-block
-- `AppMode::VideoPlayer` — video via Kitty or half-block; `prev_mode` restored on close
-- `AppMode::PdfViewer` — scrollable text pages
+- `AppMode::ImageViewer` — static images and animated GIFs, with zoom/pan and mouse controls
+- `AppMode::VideoPlayer` — aspect-correct video with sound and interactive controls; `prev_mode` restored on close
+- `AppMode::PdfViewer` — rendered pages with a text alternative, navigation, zoom/pan and mouse controls
 
 Full mode list (`core/state.rs`): `Menu | FileManager | Editor | Terminal | ProcessViewer | Git | Config | AudioPlayer | VideoPlayer | ImageViewer | PdfViewer | Favorites | Help | ThemeSwitcher | LogViewer | ServiceManager | NetworkPanel | DiskManager | Calculator | PackageManager | SshManager | SshConnectForm | SftpPanel | DockerPanel | CronEditor | ManViewer | Notes | Weather | Calendar | CommandPalette | Command(String) | Dialog(DialogKind) | Quitting`
 
@@ -92,7 +94,7 @@ For **video**, `VideoPlayer.cell_px` controls the ffmpeg decode resolution:
 - `(1, 2)` → half-block mode: ffmpeg decodes at `(width_chars × height_chars*2)` px
 - real cell size → Kitty native: ffmpeg decodes at `(width_chars × cell_px_w) × (height_chars × cell_px_h)` px — no upscaling in the terminal
 
-`app.pending_kitty: Option<KittyFrame>` is set during the draw phase; `main.rs` drains it immediately after `terminal.draw()`. `image_id=1` = image viewer, `image_id=2` = video player (stable IDs allow in-place frame replacement without flicker).
+`app.pending_kitty: Option<KittyFrame>` is set during the draw phase; `main.rs` drains it immediately after `terminal.draw()`. `image_id=1` = image viewer, `image_id=2` = video player, `image_id=3` = visual PDF page. Stable IDs plus `(area, content_version)` caching avoid redundant transfers and flicker. `RasterImage` keeps every medium's aspect ratio and renders only the visible crop while zoomed/panned.
 
 ### Side panel
 
@@ -104,7 +106,7 @@ Animated slide-in: `state.side_pct_target` is set to 40 (open) or 0 (close); `ti
 
 ### Video prefetch
 
-`VideoPlayer` maintains a background thread that pre-decodes `PREFETCH_AHEAD=8` frames into a `FrameBuffer` (Arc<Mutex<VecDeque<RawFrame>>>). `advance_frame()` pulls from this buffer; falls back to synchronous ffmpeg on cache miss. ANSI half-block render cache (`render_cache`) is skipped in Kitty mode — only raw pixel data is stored.
+`VideoPlayer` maintains a background `ffmpeg` pipe reader with a bounded 30-frame `FrameBuffer` (Arc<Mutex<VecDeque<RawFrame>>>), starting playback after 8 frames are ready. `advance_frame()` pulls from this buffer and re-buffers after underruns or seeks. Paused seeks decode and display one frame. `ffplay` is restarted at the visible position when playback, seeking, sound or speed changes; dropped players stop their sound and signal the decoder thread. ANSI half-block render cache (`render_cache`) is skipped in Kitty mode.
 
 ### Plugin system (`plugins/`)
 
@@ -167,7 +169,7 @@ use crate::ui::icons::{ICON_PLAY, ICON_PAUSE, ICON_CPU, ICON_MODE_FILES};
 
 ## Implementation notes
 
-- **No UI mutations**: `render_*()` functions are read-only; all state changes happen in `handle_input` or `app.tick()`.
+- **UI state**: render functions only update cached geometry and media frames; behavior changes happen in `handle_input` or `app.tick()`.
 - **Async model**: `tokio::select!` over crossterm `EventStream` + 16ms interval timer. Internal terminal uses `tokio::process::Command` with piped stdout via mpsc channel.
 - **Persistence**: `data/app.db` (SQLite via rusqlite) stores sessions, recent files, command history, logs. Sessions table: `sessions`. Config: `config/config.toml` (auto-created on first run).
-- **Image loading**: done in `handle_input` (blocking) — image is decoded once, stored as raw RGB24 in `app.image_rgb`, resized to fit the popup area capped at `(800, 600)`.
+- **Media loading**: `App::open_image`, `App::open_pdf` and `App::open_video` own opening/errors. Images decode once (GIF frames included, capped at 1600 px); PDF pages render lazily through Poppler at 1200 px wide and retain the two neighboring pages on each side. `modules/raster.rs` performs aspect-correct fitting, zoom and pan without Ratatui.
