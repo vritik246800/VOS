@@ -1,6 +1,5 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use image::GenericImageView;
 
 use crate::app::App;
 use crate::audio::player::AudioPlayer;
@@ -90,7 +89,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     if key.code == KeyCode::Char('m')
         && key.modifiers.is_empty()
         && app.audio_player.is_some()
-        && !matches!(app.state.mode, AppMode::Editor | AppMode::Terminal)
+        && !matches!(
+            app.state.mode,
+            AppMode::Editor | AppMode::Terminal | AppMode::VideoPlayer
+        )
         && !(matches!(app.state.mode, AppMode::Calendar) && app.calendar.editing)
         && !(matches!(app.state.mode, AppMode::Weather) && app.weather.search.active)
     {
@@ -624,58 +626,14 @@ fn handle_file_manager(app: &mut App, key: KeyEvent) -> Result<()> {
                             }
                             app.state.set_mode(AppMode::AudioPlayer);
                         }
-                        "mp4" | "mkv" | "avi" | "mov" | "webm" => {
-                            let cell_px = if app.use_kitty {
-                                app.kitty_cell_px
-                            } else {
-                                (1, 2)
-                            };
-                            app.video_player =
-                                crate::video::player::VideoPlayer::new(path, 80, 40, cell_px).ok();
-                            app.state.set_mode(AppMode::VideoPlayer);
+                        ext if crate::video::player::VIDEO_EXTENSIONS.contains(&ext) => {
+                            app.open_video(path);
                         }
                         "pdf" => {
                             app.open_pdf(path);
                         }
                         ext if IMAGE_EXTENSIONS.contains(&ext) => {
-                            let title = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("image")
-                                .to_string();
-                            match std::fs::read(&path) {
-                                Ok(bytes) => match image::load_from_memory(&bytes) {
-                                    Ok(img) => {
-                                        let max_w = 1200u32;
-                                        let max_h = 900u32;
-                                        let (orig_w, orig_h) = img.dimensions();
-                                        let img = if orig_w > max_w || orig_h > max_h {
-                                            img.resize(
-                                                max_w,
-                                                max_h,
-                                                image::imageops::FilterType::Triangle,
-                                            )
-                                        } else {
-                                            img
-                                        };
-                                        let (w, h) = img.dimensions();
-                                        app.image_rgb = Some(img.to_rgb8().into_raw());
-                                        app.image_dims = (w, h);
-                                        app.image_title = title;
-                                        app.state.set_mode(AppMode::ImageViewer);
-                                    }
-                                    Err(e) => {
-                                        app.state.push_notification(Notification::error(format!(
-                                            "Cannot decode image: {e}"
-                                        )));
-                                    }
-                                },
-                                Err(e) => {
-                                    app.state.push_notification(Notification::error(format!(
-                                        "Cannot read image: {e}"
-                                    )));
-                                }
-                            }
+                            app.open_image(path);
                         }
                         _ => {
                             app.open_file(path)?;
@@ -1470,86 +1428,191 @@ fn handle_audio(app: &mut App, key: KeyEvent) -> Result<()> {
 // ── Video ─────────────────────────────────────────────────────────────────────
 
 fn handle_video(app: &mut App, key: KeyEvent) -> Result<()> {
-    if let Some(vp) = &mut app.video_player {
-        match key.code {
-            KeyCode::Char(' ') => {
-                if vp.is_playing {
-                    vp.pause()
-                } else {
-                    vp.play();
-                }
-            }
-            KeyCode::Left => vp.seek_backward(5.0),
-            KeyCode::Right => vp.seek_forward(5.0),
-            KeyCode::Esc | KeyCode::Char('q') => {
-                vp.stop();
-                let _ = crate::kitty::clear_image(2);
-                app.video_player = None;
-                app.pending_kitty = None;
-                app.kitty_last_area = None;
-                app.state.restore_mode();
-            }
-            _ => {}
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if key.code == KeyCode::Esc && app.media_fullscreen {
+            app.media_fullscreen = false;
+            return Ok(());
         }
-    } else {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            let _ = crate::kitty::clear_image(2);
-            app.state.restore_mode();
+        close_video(app);
+        return Ok(());
+    }
+    if matches!(key.code, KeyCode::Char('f' | 'F')) {
+        app.toggle_media_fullscreen();
+        return Ok(());
+    }
+    if let Some(vp) = &mut app.video_player {
+        let long_seek = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char(' ') => vp.toggle_playback(),
+            KeyCode::Char('s' | 'S') => vp.reset_to_start(),
+            KeyCode::Left => vp.seek_backward(if long_seek { 30.0 } else { 5.0 }),
+            KeyCode::Right => vp.seek_forward(if long_seek { 30.0 } else { 5.0 }),
+            KeyCode::Char('+' | '=') => vp.change_volume(true),
+            KeyCode::Char('-' | '_') => vp.change_volume(false),
+            KeyCode::Char('m' | 'M') => vp.toggle_mute(),
+            KeyCode::Char('[') => vp.change_speed(false),
+            KeyCode::Char(']') => vp.change_speed(true),
+            _ => {}
         }
     }
     Ok(())
 }
 
+fn handle_video_control(app: &mut App, control: crate::video::player::VideoControl) {
+    use crate::video::player::VideoControl;
+    if control == VideoControl::Fullscreen {
+        app.toggle_media_fullscreen();
+        return;
+    }
+    if let Some(vp) = &mut app.video_player {
+        match control {
+            VideoControl::Play => vp.toggle_playback(),
+            VideoControl::Stop => vp.reset_to_start(),
+            VideoControl::Seek(seconds) if seconds.is_negative() => {
+                vp.seek_backward(f64::from(seconds.unsigned_abs()))
+            }
+            VideoControl::Seek(seconds) => vp.seek_forward(f64::from(seconds)),
+            VideoControl::Quieter => vp.change_volume(false),
+            VideoControl::Louder => vp.change_volume(true),
+            VideoControl::Mute => vp.toggle_mute(),
+            VideoControl::Slower => vp.change_speed(false),
+            VideoControl::Faster => vp.change_speed(true),
+            VideoControl::Fullscreen => {}
+        }
+    }
+}
+
+fn close_video(app: &mut App) {
+    if let Some(vp) = &mut app.video_player {
+        vp.stop();
+    }
+    let _ = crate::kitty::clear_image(2);
+    app.video_player = None;
+    app.media_fullscreen = false;
+    app.video_scrubbing = false;
+    app.reset_kitty_cache();
+    app.state.restore_mode();
+}
+
 // ── Image Viewer ──────────────────────────────────────────────────────────────
 
 fn handle_image(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            let _ = crate::kitty::clear_image(1);
-            app.image_rgb = None;
-            app.image_dims = (0, 0);
-            app.image_title = String::new();
-            app.pending_kitty = None;
-            app.kitty_last_area = None;
-            app.state.restore_mode();
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if key.code == KeyCode::Esc && app.media_fullscreen {
+            app.media_fullscreen = false;
+            return;
         }
-        _ => {}
+        close_image(app);
+        return;
     }
+    if matches!(key.code, KeyCode::Char('f' | 'F')) {
+        app.toggle_media_fullscreen();
+        return;
+    }
+    if let Some(viewer) = &mut app.image_viewer {
+        match key.code {
+            KeyCode::Char(' ') => viewer.toggle_playback(),
+            KeyCode::Char('[') => viewer.step_frame(false),
+            KeyCode::Char(']') => viewer.step_frame(true),
+            KeyCode::Char('+' | '=') => viewer.zoom_by(1.25),
+            KeyCode::Char('-' | '_') => viewer.zoom_by(0.8),
+            KeyCode::Char('0') => viewer.reset_view(),
+            KeyCode::Left => viewer.pan_by(0.1, 0.0),
+            KeyCode::Right => viewer.pan_by(-0.1, 0.0),
+            KeyCode::Up => viewer.pan_by(0.0, 0.1),
+            KeyCode::Down => viewer.pan_by(0.0, -0.1),
+            _ => {}
+        }
+    }
+}
+
+fn close_image(app: &mut App) {
+    let _ = crate::kitty::clear_image(1);
+    app.image_viewer = None;
+    app.media_fullscreen = false;
+    app.media_drag = None;
+    app.reset_kitty_cache();
+    app.state.restore_mode();
 }
 
 // ── PDF Viewer ────────────────────────────────────────────────────────────────
 
 fn handle_pdf(app: &mut App, key: KeyEvent) {
-    let total = app.pdf_pages.len();
-    match key.code {
-        KeyCode::Up => {
-            app.pdf_scroll = app.pdf_scroll.saturating_sub(1);
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if key.code == KeyCode::Esc && app.media_fullscreen {
+            app.media_fullscreen = false;
+            return;
         }
-        KeyCode::Down => {
-            if app.pdf_scroll + 1 < total {
-                app.pdf_scroll += 1;
-            }
-        }
-        KeyCode::PageUp => {
-            app.pdf_scroll = app.pdf_scroll.saturating_sub(20);
-        }
-        KeyCode::PageDown => {
-            app.pdf_scroll = (app.pdf_scroll + 20).min(total.saturating_sub(1));
-        }
-        KeyCode::Home => {
-            app.pdf_scroll = 0;
-        }
-        KeyCode::End => {
-            app.pdf_scroll = total.saturating_sub(1);
-        }
-        KeyCode::Esc => {
-            app.pdf_pages.clear();
-            app.pdf_title.clear();
-            app.pdf_scroll = 0;
-            app.state.restore_mode();
-        }
-        _ => {}
+        close_pdf(app);
+        return;
     }
+    if matches!(key.code, KeyCode::Char('f' | 'F')) {
+        app.toggle_media_fullscreen();
+        return;
+    }
+
+    let visible_height = usize::from(app.last_areas.pdf_body.height);
+    let mut mode_toggled = false;
+    if let Some(document) = &mut app.pdf {
+        let result = match key.code {
+            KeyCode::PageDown | KeyCode::Right => Some(document.next_page()),
+            KeyCode::PageUp | KeyCode::Left => Some(document.previous_page()),
+            KeyCode::Home => Some(document.show_page(0)),
+            KeyCode::End => Some(document.show_page(usize::MAX)),
+            KeyCode::Up if document.is_visual() => Some(document.previous_page()),
+            KeyCode::Down | KeyCode::Char(' ') if document.is_visual() => {
+                Some(document.next_page())
+            }
+            KeyCode::Up => {
+                document.scroll_by(-1, visible_height);
+                None
+            }
+            KeyCode::Down => {
+                document.scroll_by(1, visible_height);
+                None
+            }
+            KeyCode::Char(' ') => {
+                document.scroll_by(visible_height as isize, visible_height);
+                None
+            }
+            KeyCode::Char('t' | 'T') => {
+                mode_toggled = true;
+                Some(document.toggle_mode())
+            }
+            KeyCode::Char('+' | '=') => {
+                document.zoom_by(1.25);
+                None
+            }
+            KeyCode::Char('-' | '_') => {
+                document.zoom_by(0.8);
+                None
+            }
+            KeyCode::Char('0') => {
+                document.reset_view();
+                None
+            }
+            _ => None,
+        };
+        if let Some(Err(error)) = result {
+            app.state
+                .push_notification(Notification::error(format!("PDF: {error}")));
+        }
+    }
+    if mode_toggled {
+        if app.pdf.as_ref().is_some_and(|pdf| !pdf.is_visual()) {
+            let _ = crate::kitty::clear_image(3);
+        }
+        app.reset_kitty_cache();
+    }
+}
+
+fn close_pdf(app: &mut App) {
+    let _ = crate::kitty::clear_image(3);
+    app.pdf = None;
+    app.media_fullscreen = false;
+    app.media_drag = None;
+    app.reset_kitty_cache();
+    app.state.restore_mode();
 }
 
 // ── Help ──────────────────────────────────────────────────────────────────────
@@ -1611,66 +1674,169 @@ fn handle_mouse(app: &mut App, event: MouseEvent) {
 
     let col = event.column;
     let row = event.row;
+    use crossterm::event::MouseButton;
 
     match event.kind {
-        // ── Scroll wheel: 3 steps per notch ──────────────────────────────────
-        MouseEventKind::ScrollDown => match app.state.mode {
-            AppMode::FileManager => {
-                for _ in 0..3 {
-                    app.explorer.move_down();
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let up = event.kind == MouseEventKind::ScrollUp;
+            match app.state.mode {
+                AppMode::FileManager => {
+                    for _ in 0..3 {
+                        if up {
+                            app.explorer.move_up();
+                        } else {
+                            app.explorer.move_down();
+                        }
+                    }
                 }
-            }
-            AppMode::ProcessViewer => {
-                for _ in 0..3 {
-                    app.process_viewer.move_down();
+                AppMode::ProcessViewer => {
+                    for _ in 0..3 {
+                        if up {
+                            app.process_viewer.move_up();
+                        } else {
+                            app.process_viewer.move_down();
+                        }
+                    }
                 }
-            }
-            _ => {}
-        },
-        MouseEventKind::ScrollUp => match app.state.mode {
-            AppMode::FileManager => {
-                for _ in 0..3 {
-                    app.explorer.move_up();
+                AppMode::ImageViewer => {
+                    if let Some(viewer) = &mut app.image_viewer {
+                        viewer.zoom_by(if up { 1.2 } else { 0.8 });
+                    }
                 }
-            }
-            AppMode::ProcessViewer => {
-                for _ in 0..3 {
-                    app.process_viewer.move_up();
+                AppMode::VideoPlayer => {
+                    if let Some(vp) = &mut app.video_player {
+                        vp.change_volume(up);
+                    }
                 }
+                AppMode::PdfViewer => {
+                    let visible_height = usize::from(app.last_areas.pdf_body.height);
+                    let mut action = None;
+                    if let Some(document) = &mut app.pdf {
+                        if document.is_visual() {
+                            action = Some(if up {
+                                document.previous_page()
+                            } else {
+                                document.next_page()
+                            });
+                        } else if up && document.scroll == 0 {
+                            action = Some(document.previous_page());
+                        } else if !up && document.scroll >= document.max_scroll(visible_height) {
+                            action = Some(document.next_page());
+                        } else {
+                            document.scroll_by(if up { -3 } else { 3 }, visible_height);
+                        }
+                    }
+                    if let Some(result) = action {
+                        if let Err(error) = result {
+                            app.state
+                                .push_notification(Notification::error(format!("PDF: {error}")));
+                        }
+                        app.reset_kitty_cache();
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
 
-        // ── Left click: select item; double-click = Enter ─────────────────────
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            // Detect double-click (threshold: 400 ms)
+        MouseEventKind::Down(MouseButton::Left) => {
             let is_double = app
                 .last_click
-                .map(|t| t.elapsed().as_millis() < 400)
+                .map(|time| time.elapsed().as_millis() < 400)
                 .unwrap_or(false);
             app.last_click = Some(std::time::Instant::now());
 
             match app.state.mode {
+                AppMode::ImageViewer => {
+                    if area_contains(app.last_areas.image_body, col, row) {
+                        if is_double {
+                            if let Some(viewer) = &mut app.image_viewer {
+                                viewer.reset_view();
+                            }
+                            app.media_drag = None;
+                        } else {
+                            app.media_drag = Some((col, row));
+                        }
+                    }
+                }
+                AppMode::PdfViewer => {
+                    if area_contains(app.last_areas.pdf_previous, col, row) {
+                        let action = app.pdf.as_mut().map(|pdf| pdf.previous_page());
+                        if let Some(result) = action {
+                            if let Err(error) = result {
+                                app.state.push_notification(Notification::error(format!(
+                                    "PDF: {error}"
+                                )));
+                            }
+                            app.reset_kitty_cache();
+                        }
+                    } else if area_contains(app.last_areas.pdf_next, col, row) {
+                        let action = app.pdf.as_mut().map(|pdf| pdf.next_page());
+                        if let Some(result) = action {
+                            if let Err(error) = result {
+                                app.state.push_notification(Notification::error(format!(
+                                    "PDF: {error}"
+                                )));
+                            }
+                            app.reset_kitty_cache();
+                        }
+                    } else if area_contains(app.last_areas.pdf_mode, col, row) {
+                        let toggle_error = app
+                            .pdf
+                            .as_mut()
+                            .and_then(|document| document.toggle_mode().err());
+                        if let Some(error) = toggle_error {
+                            app.state
+                                .push_notification(Notification::error(format!("PDF: {error}")));
+                        }
+                        if app.pdf.as_ref().is_some_and(|pdf| !pdf.is_visual()) {
+                            let _ = crate::kitty::clear_image(3);
+                        }
+                        app.reset_kitty_cache();
+                    } else if area_contains(app.last_areas.pdf_body, col, row) {
+                        if is_double {
+                            if let Some(document) = &mut app.pdf {
+                                document.reset_view();
+                            }
+                            app.media_drag = None;
+                        } else if app.pdf.as_ref().is_some_and(|pdf| pdf.is_visual()) {
+                            app.media_drag = Some((col, row));
+                        }
+                    }
+                }
+                AppMode::VideoPlayer => {
+                    if area_contains(app.last_areas.video_progress, col, row) {
+                        if let Some(fraction) = video_fraction(app, col) {
+                            if let Some(vp) = &mut app.video_player {
+                                vp.scrub_to(fraction);
+                            }
+                            app.video_scrubbing = true;
+                        }
+                    } else if area_contains(app.last_areas.video_controls, col, row) {
+                        let relative = col.saturating_sub(app.last_areas.video_controls.x);
+                        let control = app
+                            .video_player
+                            .as_ref()
+                            .and_then(|vp| vp.button_at(relative));
+                        if let Some(control) = control {
+                            handle_video_control(app, control);
+                        }
+                    } else if area_contains(app.last_areas.video_frame, col, row) {
+                        handle_video_control(app, crate::video::player::VideoControl::Play);
+                    }
+                }
                 AppMode::FileManager => {
                     let area = app.last_areas.file_list;
-                    if col >= area.x
-                        && col < area.x + area.width
-                        && row >= area.y
-                        && row < area.y + area.height
-                    {
-                        // The List widget draws items starting at y+1 (inside border).
+                    if area_contains(area, col, row) {
                         let inner_y = area.y + 1;
                         if row >= inner_y {
-                            let click_row = (row - inner_y) as usize;
-                            let offset = app.explorer.list_state.offset();
-                            let idx = offset + click_row;
+                            let idx = app.explorer.list_state.offset() + (row - inner_y) as usize;
                             if idx < app.explorer.entries.len() {
                                 app.explorer.list_state.select(Some(idx));
                                 if is_double {
-                                    // Simulate Enter key press on the selected item
-                                    let fake_enter =
-                                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                                    let _ = handle_file_manager(app, fake_enter);
+                                    let _ = handle_file_manager(
+                                        app,
+                                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                                    );
                                 }
                             }
                         }
@@ -1678,17 +1844,11 @@ fn handle_mouse(app: &mut App, event: MouseEvent) {
                 }
                 AppMode::ProcessViewer => {
                     let area = app.last_areas.process_list;
-                    if col >= area.x
-                        && col < area.x + area.width
-                        && row >= area.y
-                        && row < area.y + area.height
-                    {
-                        // render_list draws a 1-row header then the list inside a border
-                        let inner_y = area.y + 2; // border(1) + header(1)
+                    if area_contains(area, col, row) {
+                        let inner_y = area.y + 2;
                         if row >= inner_y {
-                            let click_row = (row - inner_y) as usize;
-                            let offset = app.process_viewer.list_state.offset();
-                            let idx = offset + click_row;
+                            let idx =
+                                app.process_viewer.list_state.offset() + (row - inner_y) as usize;
                             if idx < app.process_viewer.filtered.len() {
                                 app.process_viewer.list_state.select(Some(idx));
                             }
@@ -1697,16 +1857,10 @@ fn handle_mouse(app: &mut App, event: MouseEvent) {
                 }
                 AppMode::Menu => {
                     let area = app.last_areas.menu_list;
-                    if col >= area.x
-                        && col < area.x + area.width
-                        && row >= area.y
-                        && row < area.y + area.height
-                    {
+                    if area_contains(area, col, row) {
                         let inner_y = area.y + 1;
                         if row >= inner_y {
-                            let click_row = (row - inner_y) as usize;
-                            let offset = app.menu_state.offset();
-                            let idx = offset + click_row;
+                            let idx = app.menu_state.offset() + (row - inner_y) as usize;
                             if idx < crate::ui::menu::MENU_LEN {
                                 app.menu_state.select(Some(idx));
                             }
@@ -1716,8 +1870,75 @@ fn handle_mouse(app: &mut App, event: MouseEvent) {
                 _ => {}
             }
         }
+
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.video_scrubbing {
+                if let Some(fraction) = video_fraction(app, col) {
+                    if let Some(vp) = &mut app.video_player {
+                        vp.scrub_to(fraction);
+                    }
+                }
+            } else if let Some((previous_col, previous_row)) = app.media_drag {
+                let dx = i32::from(col) - i32::from(previous_col);
+                let dy = i32::from(row) - i32::from(previous_row);
+                match app.state.mode {
+                    AppMode::ImageViewer => {
+                        let area = app.last_areas.image_body;
+                        if let Some(viewer) = &mut app.image_viewer {
+                            viewer.pan_by(
+                                dx as f32 / f32::from(area.width.max(1)),
+                                dy as f32 / f32::from(area.height.max(1)),
+                            );
+                        }
+                    }
+                    AppMode::PdfViewer => {
+                        let area = app.last_areas.pdf_body;
+                        if let Some(document) = &mut app.pdf {
+                            document.pan_by(
+                                dx as f32 / f32::from(area.width.max(1)),
+                                dy as f32 / f32::from(area.height.max(1)),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                app.media_drag = Some((col, row));
+            }
+        }
+
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.video_scrubbing {
+                if let Some(fraction) = video_fraction(app, col) {
+                    if let Some(vp) = &mut app.video_player {
+                        vp.seek_to(fraction);
+                    }
+                }
+                app.video_scrubbing = false;
+            }
+            app.media_drag = None;
+        }
         _ => {}
     }
+}
+
+fn area_contains(area: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= area.x
+        && col < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn video_fraction(app: &App, col: u16) -> Option<f64> {
+    let area = app.last_areas.video_progress;
+    let vp = app.video_player.as_ref()?;
+    let (start, length) = vp.progress_layout(area.width);
+    if length == 0 {
+        return None;
+    }
+    let relative = col
+        .saturating_sub(area.x)
+        .clamp(start, start + length.saturating_sub(1));
+    vp.fraction_at(area.width, relative)
 }
 
 // ── Phase 2: Log Viewer ────────────────────────────────────────────────────────
@@ -2445,7 +2666,7 @@ fn handle_notes(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Decode an image file and open it in the ImageViewer popup (reused by Notes).
+/// Open an image from the file manager or an embedded note image.
 fn open_image_file(app: &mut App, path: std::path::PathBuf) {
     if !path.exists() {
         app.state.push_notification(Notification::warning(format!(
@@ -2454,34 +2675,7 @@ fn open_image_file(app: &mut App, path: std::path::PathBuf) {
         )));
         return;
     }
-    let title = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("image")
-        .to_string();
-    match std::fs::read(&path) {
-        Ok(bytes) => match image::load_from_memory(&bytes) {
-            Ok(img) => {
-                let (orig_w, orig_h) = img.dimensions();
-                let img = if orig_w > 1200 || orig_h > 900 {
-                    img.resize(1200, 900, image::imageops::FilterType::Triangle)
-                } else {
-                    img
-                };
-                let (w, h) = img.dimensions();
-                app.image_rgb = Some(img.to_rgb8().into_raw());
-                app.image_dims = (w, h);
-                app.image_title = title;
-                app.state.set_mode(AppMode::ImageViewer);
-            }
-            Err(e) => app
-                .state
-                .push_notification(Notification::error(format!("Cannot decode image: {e}"))),
-        },
-        Err(e) => app
-            .state
-            .push_notification(Notification::error(format!("Cannot read image: {e}"))),
-    }
+    app.open_image(path);
 }
 
 // ── Phase 6.5: Weather ─────────────────────────────────────────────────────────
