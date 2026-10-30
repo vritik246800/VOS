@@ -62,7 +62,11 @@ pub fn rgb_to_halfblock_lines(
     };
     let target_w = (cols as u32).max(1);
     let target_h = ((rows as u32) * 2).max(2);
-    let scaled = imageops::resize(&img, target_w, target_h, imageops::FilterType::Triangle);
+    let scaled = if img.dimensions() == (target_w, target_h) {
+        img
+    } else {
+        imageops::resize(&img, target_w, target_h, imageops::FilterType::Triangle)
+    };
     let sw = scaled.width();
     let sh = scaled.height();
 
@@ -88,7 +92,7 @@ pub fn rgb_to_halfblock_lines(
         .collect()
 }
 
-/// Image ID 1 = ImageViewer, 2 = VideoPlayer.
+/// Image ID 1 = ImageViewer, 2 = VideoPlayer, 3 = visual PdfViewer.
 /// Using stable IDs allows Kitty to replace frames in-place (no flicker)
 /// and allows targeted deletion when the viewer is closed.
 pub struct KittyFrame {
